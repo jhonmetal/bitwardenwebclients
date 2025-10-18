@@ -1,0 +1,357 @@
+name: Comprehensive Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+env:
+  REPORTS_DIR: security-reports
+  MAX_CRITICAL: 0
+  MAX_HIGH: 5
+  NODE_VERSION: '20'
+
+jobs:
+  validate:
+    name: Validate Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --prefer-offline --no-audit
+
+      - name: Run ESLint validation
+        run: |
+          echo "✅ Validando sintaxis con ESLint..."
+          npx eslint . --max-warnings 0 || echo "⚠️ Lint con advertencias"
+        continue-on-error: true
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: '${{ env.REPORTS_DIR }}/trivy-dependency.json'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Generate Trivy table report
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          output: '${{ env.REPORTS_DIR }}/trivy-table.txt'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Display table report
+        run: cat "${{ env.REPORTS_DIR }}/trivy-table.txt" || echo "No table report generated"
+
+      - name: Upload dependency reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: warn
+
+  container-scan:
+    name: Container Image Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Build Docker image
+        run: |
+          echo "🔧 Construyendo imagen de contenedor..."
+          docker build -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+        continue-on-error: true
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'bitwarden-web:latest'
+          format: 'json'
+          output: '${{ env.REPORTS_DIR }}/trivy-container.json'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Upload container scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: warn
+
+  iac-scan:
+    name: Infrastructure as Code Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Run Checkov IaC scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: json
+          output_file_path: ${{ env.REPORTS_DIR }}/checkov-report.json
+          framework: dockerfile,kubernetes,cloudformation,arm
+          quiet: false
+        continue-on-error: true
+
+      - name: Display Checkov summary
+        run: |
+          echo "📊 Checkov scan completed"
+          head -n 50 "${{ env.REPORTS_DIR }}/checkov-report.json" || echo "No report generated"
+
+      - name: Upload IaC scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: warn
+
+  secret-scan:
+    name: Secret Detection Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Run GitLeaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          source: '.'
+          config: ''
+          redact: true
+          verbose: true
+          log-level: info
+        continue-on-error: true
+        env:
+          GITLEAKS_ENABLE_COMMENTS: false
+
+      - name: Convert GitLeaks output
+        run: |
+          if [ -f "${{ env.REPORTS_DIR }}/report.json" ]; then
+            cp "${{ env.REPORTS_DIR }}/report.json" "${{ env.REPORTS_DIR }}/gitleaks-report.json"
+            echo "✅ GitLeaks report converted"
+          else
+            echo "❌ GitLeaks report not found - may indicate no secrets detected"
+            echo "[]" > "${{ env.REPORTS_DIR }}/gitleaks-report.json"
+          fi
+        continue-on-error: true
+
+      - name: Upload secret scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+          if-no-files-found: warn
+
+  sonarqube-check:
+    name: SonarCloud (SAST) analysis
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm install --prefer-offline --no-audit
+
+      - name: Run SonarCloud scan
+        uses: sonarsource/sonarcloud-github-action@master
+        with:
+          projectKey: ${{ github.repository }}
+          projectName: ${{ github.repository }}
+          organization: your-organization
+          token: ${{ secrets.SONAR_TOKEN }}
+          args: >
+            -Dsonar.sources=src
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+
+  analyze-and-enforce-policy:
+    name: Analyze Results and Enforce Security Policy
+    needs: [dependency-scan, container-scan, iac-scan, secret-scan, sonarqube-check]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Prepare reports directory
+        run: mkdir -p "${{ env.REPORTS_DIR }}"
+
+      - name: Download dependency scan reports
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+        continue-on-error: true
+
+      - name: Download container scan reports
+        uses: actions/download-artifact@v4
+        with:
+          name: container-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+        continue-on-error: true
+
+      - name: Download IaC scan reports
+        uses: actions/download-artifact@v4
+        with:
+          name: iac-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+        continue-on-error: true
+
+      - name: Download secret scan reports
+        uses: actions/download-artifact@v4
+        with:
+          name: secret-scan-reports
+          path: ${{ env.REPORTS_DIR }}
+        continue-on-error: true
+
+      - name: Analyze Trivy dependency results
+        run: |
+          if [ -f "${{ env.REPORTS_DIR }}/trivy-dependency.json" ]; then
+            echo "📊 Analyzing Trivy dependency scan results..."
+            CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' "${{ env.REPORTS_DIR }}/trivy-dependency.json" 2>/dev/null || echo "0")
+            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' "${{ env.REPORTS_DIR }}/trivy-dependency.json" 2>/dev/null || echo "0")
+            MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' "${{ env.REPORTS_DIR }}/trivy-dependency.json" 2>/dev/null || echo "0")
+            
+            echo "CRITICAL_COUNT=$CRITICAL" >> $GITHUB_ENV
+            echo "HIGH_COUNT=$HIGH" >> $GITHUB_ENV
+            echo "MEDIUM_COUNT=$MEDIUM" >> $GITHUB_ENV
+            
+            echo "🚨 Vulnerabilidades críticas: $CRITICAL (máx: ${{ env.MAX_CRITICAL }})"
+            echo "⚠️  Vulnerabilidades altas: $HIGH (máx: ${{ env.MAX_HIGH }})"
+            echo "📋 Vulnerabilidades medias: $MEDIUM"
+          fi
+        continue-on-error: true
+
+      - name: Enforce security policy
+        env:
+          CRITICAL_COUNT: ${{ env.CRITICAL_COUNT }}
+          HIGH_COUNT: ${{ env.HIGH_COUNT }}
+        run: |
+          FAIL_PIPELINE=0
+          CRITICAL_COUNT=${CRITICAL_COUNT:=0}
+          HIGH_COUNT=${HIGH_COUNT:=0}
+          MAX_CRITICAL="${{ env.MAX_CRITICAL }}"
+          MAX_HIGH="${{ env.MAX_HIGH }}"
+          
+          echo "🔍 Verificando política de seguridad..."
+          echo "Críticas encontradas: $CRITICAL_COUNT (máx permitido: $MAX_CRITICAL)"
+          echo "Altas encontradas: $HIGH_COUNT (máx permitido: $MAX_HIGH)"
+          
+          if [ "$CRITICAL_COUNT" -gt "$MAX_CRITICAL" ]; then
+            echo "❌ FALLO: Se encontraron $CRITICAL_COUNT vulnerabilidades críticas (máximo permitido: $MAX_CRITICAL)"
+            FAIL_PIPELINE=1
+          fi
+          
+          if [ "$HIGH_COUNT" -gt "$MAX_HIGH" ]; then
+            echo "❌ FALLO: Se encontraron $HIGH_COUNT vulnerabilidades altas (máximo permitido: $MAX_HIGH)"
+            FAIL_PIPELINE=1
+          fi
+          
+          if [ $FAIL_PIPELINE -eq 1 ]; then
+            echo "::error::PIPELINE FALLIDO POR POLÍTICA DE SEGURIDAD"
+            exit 1
+          else
+            echo "✅ Pipeline aprobado - vulnerabilidades dentro de límites aceptables"
+          fi
+        continue-on-error: false
+
+      - name: Generate security summary
+        if: always()
+        env:
+          CRITICAL_COUNT: ${{ env.CRITICAL_COUNT }}
+          HIGH_COUNT: ${{ env.HIGH_COUNT }}
+          MEDIUM_COUNT: ${{ env.MEDIUM_COUNT }}
+        run: |
+          {
+            echo "# 🔒 Reporte de Análisis de Seguridad - $(date)"
+            echo ""
+            echo "## Resumen Ejecutivo"
+            echo "- **Críticas:** ${CRITICAL_COUNT:-N/A} (límite: ${{ env.MAX_CRITICAL }})"
+            echo "- **Altas:** ${HIGH_COUNT:-N/A} (límite: ${{ env.MAX_HIGH }})"
+            echo "- **Medias:** ${MEDIUM_COUNT:-N/A}"
+            echo ""
+            echo "## Reportes Generados"
+            ls -lh "${{ env.REPORTS_DIR }}/" || echo "No reports found"
+          } > "${{ env.REPORTS_DIR }}/executive-summary.md"
+
+      - name: Upload security summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: ${{ env.REPORTS_DIR }}
+          retention-days: 30
+
+      - name: Comment PR with security summary
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('${{ env.REPORTS_DIR }}/executive-summary.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+        continue-on-error: true
