@@ -1,4 +1,5 @@
-# Angular specific
+!dev-server.shared.pem
+stats.json
 /dist/
 /out-tsc/
 /tmp/
