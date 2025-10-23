@@ -1,3 +1,15 @@
-*
-!build/*
+node_modules
+.git
+.vscode
+dist
+build
+*.log
+.env
+
+# Include files required for frontend Docker build
+!package*.json
 !entrypoint.sh
+!src/
+!apps/
+!Dockerfile.frontend
+!Dockerfile

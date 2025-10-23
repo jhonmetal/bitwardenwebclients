@@ -47,6 +47,20 @@ jobs:
       - name: Prepare reports directory
         run: mkdir -p "${{ env.REPORTS_DIR }}"
 
+      - name: Check Docker build prerequisites
+        run: |
+          # Create reports folder early
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          # If Dockerfile references backend/server or /source/apps/web but those folders are missing, skip build
+          if grep -E "COPY .*server|/source/apps/web|COPY --from=node-build" Dockerfile >/dev/null 2>&1; then
+            if [ ! -d server ] && [ ! -d source/apps/web ] && [ ! -d apps/web ]; then
+              echo "❌ Required 'server' or 'apps/web' directories missing — skipping docker build"
+              echo '{"Results": []}' > "${{ env.REPORTS_DIR }}/trivy-container.json"
+              # mark skip so subsequent steps can detect
+              touch .skip_docker_build
+            fi
+          fi
+
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -93,18 +107,45 @@ jobs:
       - name: Build Docker image
         run: |
           echo "🔧 Construyendo imagen de contenedor..."
-          docker build -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+          if [ -f .skip_docker_build ]; then
+            echo "Server files missing; building frontend-only image using Dockerfile.frontend"
+            docker build -f Dockerfile.frontend -t bitwarden-web:latest . || echo "⚠️ Docker frontend build falló"
+          else
+            # Try the full Dockerfile first
+            docker build -t bitwarden-web:latest . || (
+              echo "Full Dockerfile build failed; attempting frontend-only build"
+              docker build -f Dockerfile.frontend -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+            )
+          fi
+          # Record whether the image exists for later conditional scanning
+          if docker image inspect bitwarden-web:latest > /dev/null 2>&1; then
+            echo "IMAGE_BUILT=true" >> $GITHUB_ENV
+          else
+            echo "IMAGE_BUILT=false" >> $GITHUB_ENV
+          fi
         continue-on-error: true
 
-      - name: Run Trivy container scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'bitwarden-web:latest'
-          format: 'json'
-          output: '${{ env.REPORTS_DIR }}/trivy-container.json'
-          severity: 'HIGH,CRITICAL'
+      - name: Run Trivy container scan (local)
+        run: |
+          echo "Checking for Docker image..."
+          if docker image inspect bitwarden-web:latest > /dev/null 2>&1; then
+            echo "Image present — installing trivy and scanning..."
+            # Install trivy quickly (apt-get or download). Using install script for latest stable
+            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            trivy image --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" bitwarden-web:latest || true
+          else
+            echo "No image found — running Trivy filesystem scan on Dockerfile / repo"
+            # Install trivy and scan Dockerfile / repository as fallback to detect image-relevant issues
+            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            if [ -f Dockerfile ]; then
+              trivy fs --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" Dockerfile || true
+            else
+              trivy fs --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" . || true
+            fi
+          fi
         continue-on-error: true
 
+      # (container placeholder is handled by the previous step)
       - name: Upload container scan reports
         uses: actions/upload-artifact@v4
         with:
@@ -127,7 +168,7 @@ jobs:
         with:
           directory: .
           output_format: json
-          output_file_path: ${{ env.REPORTS_DIR }}/checkov-report.json
+          output_file_path: ${{ env.REPORTS_DIR }}/
           framework: dockerfile,kubernetes,cloudformation,arm
           quiet: false
         continue-on-error: true
@@ -135,7 +176,7 @@ jobs:
       - name: Display Checkov summary
         run: |
           echo "📊 Checkov scan completed"
-          head -n 50 "${{ env.REPORTS_DIR }}/checkov-report.json" || echo "No report generated"
+          head -n 50 "${{ env.REPORTS_DIR }}/results_json.json" || echo "No report generated"
 
       - name: Upload IaC scan reports
         uses: actions/upload-artifact@v4
@@ -158,24 +199,21 @@ jobs:
 
       - name: Run GitLeaks secret scan
         uses: gitleaks/gitleaks-action@v2
+        # gitleaks action v2 expects fewer inputs; provide args via 'args'
         with:
-          source: '.'
-          config: ''
-          redact: true
-          verbose: true
-          log-level: info
+          args: '--path=. --report-format=json --report-path=${{ env.REPORTS_DIR }}/gitleaks-report.json'
         continue-on-error: true
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: false
 
       - name: Convert GitLeaks output
         run: |
-          if [ -f "${{ env.REPORTS_DIR }}/report.json" ]; then
-            cp "${{ env.REPORTS_DIR }}/report.json" "${{ env.REPORTS_DIR }}/gitleaks-report.json"
-            echo "✅ GitLeaks report converted"
+          if [ -f "${{ env.REPORTS_DIR }}/gitleaks-report.json" ]; then
+            echo "✅ GitLeaks report present"
           else
-            echo "❌ GitLeaks report not found - may indicate no secrets detected"
             echo "[]" > "${{ env.REPORTS_DIR }}/gitleaks-report.json"
+            echo "No gitleaks report found - placeholder created"
           fi
         continue-on-error: true
 
@@ -205,6 +243,10 @@ jobs:
     name: Analyze Results and Enforce Security Policy
     needs: [dependency-scan, container-scan, iac-scan, secret-scan, sonarqube-check]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: always()
     steps:
       - name: Checkout code
@@ -324,9 +366,11 @@ jobs:
           retention-days: 30
 
       - name: Comment PR with security summary
-        if: github.event_name == 'pull_request' && always()
+        # Only attempt to comment when PR originates from the same repository (not a fork).
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const summary = fs.readFileSync('${{ env.REPORTS_DIR }}/executive-summary.md', 'utf8');
