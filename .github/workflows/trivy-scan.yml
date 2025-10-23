@@ -175,6 +175,7 @@ jobs:
           args: '--path=. --report-format=json --report-path=${{ env.REPORTS_DIR }}/gitleaks-report.json'
         continue-on-error: true
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: false
 
       - name: Convert GitLeaks output
