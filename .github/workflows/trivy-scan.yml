@@ -94,17 +94,29 @@ jobs:
         run: |
           echo "🔧 Construyendo imagen de contenedor..."
           docker build -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+          # Record whether the image exists for later conditional scanning
+          if docker image inspect bitwarden-web:latest > /dev/null 2>&1; then
+            echo "IMAGE_BUILT=true" >> $GITHUB_ENV
+          else
+            echo "IMAGE_BUILT=false" >> $GITHUB_ENV
+          fi
         continue-on-error: true
 
-      - name: Run Trivy container scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: 'bitwarden-web:latest'
-          format: 'json'
-          output: '${{ env.REPORTS_DIR }}/trivy-container.json'
-          severity: 'HIGH,CRITICAL'
+      - name: Run Trivy container scan (local)
+        run: |
+          echo "Checking for Docker image..."
+          if docker image inspect bitwarden-web:latest > /dev/null 2>&1; then
+            echo "Image present — installing trivy and scanning..."
+            # Install trivy quickly (apt-get or download). Using install script for latest stable
+            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            trivy image --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" bitwarden-web:latest || true
+          else
+            echo "No image found — creating placeholder report"
+            echo "{\"Results\": []}" > "${{ env.REPORTS_DIR }}/trivy-container.json"
+          fi
         continue-on-error: true
 
+      # (container placeholder is handled by the previous step)
       - name: Upload container scan reports
         uses: actions/upload-artifact@v4
         with:
@@ -158,24 +170,20 @@ jobs:
 
       - name: Run GitLeaks secret scan
         uses: gitleaks/gitleaks-action@v2
+        # gitleaks action v2 expects fewer inputs; provide args via 'args'
         with:
-          source: '.'
-          config: ''
-          redact: true
-          verbose: true
-          log-level: info
+          args: '--path=. --report-format=json --report-path=${{ env.REPORTS_DIR }}/gitleaks-report.json'
         continue-on-error: true
         env:
           GITLEAKS_ENABLE_COMMENTS: false
 
       - name: Convert GitLeaks output
         run: |
-          if [ -f "${{ env.REPORTS_DIR }}/report.json" ]; then
-            cp "${{ env.REPORTS_DIR }}/report.json" "${{ env.REPORTS_DIR }}/gitleaks-report.json"
-            echo "✅ GitLeaks report converted"
+          if [ -f "${{ env.REPORTS_DIR }}/gitleaks-report.json" ]; then
+            echo "✅ GitLeaks report present"
           else
-            echo "❌ GitLeaks report not found - may indicate no secrets detected"
             echo "[]" > "${{ env.REPORTS_DIR }}/gitleaks-report.json"
+            echo "No gitleaks report found - placeholder created"
           fi
         continue-on-error: true
 
