@@ -214,6 +214,10 @@ jobs:
     name: Analyze Results and Enforce Security Policy
     needs: [dependency-scan, container-scan, iac-scan, secret-scan, sonarqube-check]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: always()
     steps:
       - name: Checkout code
@@ -333,9 +337,11 @@ jobs:
           retention-days: 30
 
       - name: Comment PR with security summary
-        if: github.event_name == 'pull_request' && always()
+        # Only attempt to comment when PR originates from the same repository (not a fork).
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const summary = fs.readFileSync('${{ env.REPORTS_DIR }}/executive-summary.md', 'utf8');
