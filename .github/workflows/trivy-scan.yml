@@ -47,6 +47,20 @@ jobs:
       - name: Prepare reports directory
         run: mkdir -p "${{ env.REPORTS_DIR }}"
 
+      - name: Check Docker build prerequisites
+        run: |
+          # Create reports folder early
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          # If Dockerfile references backend/server or /source/apps/web but those folders are missing, skip build
+          if grep -E "COPY .*server|/source/apps/web|COPY --from=node-build" Dockerfile >/dev/null 2>&1; then
+            if [ ! -d server ] && [ ! -d source/apps/web ] && [ ! -d apps/web ]; then
+              echo "❌ Required 'server' or 'apps/web' directories missing — skipping docker build"
+              echo '{"Results": []}' > "${{ env.REPORTS_DIR }}/trivy-container.json"
+              # mark skip so subsequent steps can detect
+              touch .skip_docker_build
+            fi
+          fi
+
       - name: Run Trivy filesystem scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -93,7 +107,16 @@ jobs:
       - name: Build Docker image
         run: |
           echo "🔧 Construyendo imagen de contenedor..."
-          docker build -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+          if [ -f .skip_docker_build ]; then
+            echo "Server files missing; building frontend-only image using Dockerfile.frontend"
+            docker build -f Dockerfile.frontend -t bitwarden-web:latest . || echo "⚠️ Docker frontend build falló"
+          else
+            # Try the full Dockerfile first
+            docker build -t bitwarden-web:latest . || (
+              echo "Full Dockerfile build failed; attempting frontend-only build"
+              docker build -f Dockerfile.frontend -t bitwarden-web:latest . || echo "⚠️ Docker build falló"
+            )
+          fi
           # Record whether the image exists for later conditional scanning
           if docker image inspect bitwarden-web:latest > /dev/null 2>&1; then
             echo "IMAGE_BUILT=true" >> $GITHUB_ENV
@@ -111,8 +134,14 @@ jobs:
             curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
             trivy image --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" bitwarden-web:latest || true
           else
-            echo "No image found — creating placeholder report"
-            echo "{\"Results\": []}" > "${{ env.REPORTS_DIR }}/trivy-container.json"
+            echo "No image found — running Trivy filesystem scan on Dockerfile / repo"
+            # Install trivy and scan Dockerfile / repository as fallback to detect image-relevant issues
+            curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            if [ -f Dockerfile ]; then
+              trivy fs --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" Dockerfile || true
+            else
+              trivy fs --format json --severity HIGH,CRITICAL --output "${{ env.REPORTS_DIR }}/trivy-container.json" . || true
+            fi
           fi
         continue-on-error: true
 
@@ -139,7 +168,7 @@ jobs:
         with:
           directory: .
           output_format: json
-          output_file_path: ${{ env.REPORTS_DIR }}/checkov-report.json
+          output_file_path: ${{ env.REPORTS_DIR }}/
           framework: dockerfile,kubernetes,cloudformation,arm
           quiet: false
         continue-on-error: true
@@ -147,7 +176,7 @@ jobs:
       - name: Display Checkov summary
         run: |
           echo "📊 Checkov scan completed"
-          head -n 50 "${{ env.REPORTS_DIR }}/checkov-report.json" || echo "No report generated"
+          head -n 50 "${{ env.REPORTS_DIR }}/results_json.json" || echo "No report generated"
 
       - name: Upload IaC scan reports
         uses: actions/upload-artifact@v4
